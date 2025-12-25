@@ -1,0 +1,8 @@
+cd ~/Bureau/portfolio_hjb
+cat > .gitignore <<'GIT'
+.env
+.venv/
+__pycache__/
+*.pyc
+outputs/
+GIT
