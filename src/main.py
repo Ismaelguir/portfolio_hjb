@@ -27,6 +27,14 @@ from hjb.grid import make_grid
 from hjb.solver_fd import solve_hjb_fd, recommend_nt
 from hjb.policy import interp_policy
 import numpy as np
+from market.price_cache import get_latest_price
+
+
+from storage.repo import (
+    PortfolioState, upsert_state, load_state, log_event, utc_now_iso,
+    upsert_equity_point, get_equity_series, get_latest_equity_point,
+    insert_rebalance
+)
 
 
 
@@ -170,6 +178,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_ht.add_argument("--bc", type=str, choices=["NEUMANN","DIRICHLET"], default="NEUMANN")
     p_ht.set_defaults(func=cmd_hjb_test)
 
+    p_uh = sub.add_parser("update_hjb")
+    p_uh.add_argument("--window", type=int, default=60)
+    p_uh.add_argument("--annual_days", type=int, default=252)
+    p_uh.add_argument("--nx", type=int, default=400)
+    p_uh.add_argument("--x_min_factor", type=float, default=0.1)
+    p_uh.add_argument("--x_max_factor", type=float, default=3.0)
+    p_uh.add_argument("--xmin_floor", type=float, default=1e-3)
+    p_uh.add_argument("--bc", type=str, choices=["NEUMANN","DIRICHLET"], default="NEUMANN")
+    p_uh.set_defaults(func=cmd_update_hjb)
+
+    p_sync = sub.add_parser("sync_latest_daily")
+    p_sync.set_defaults(func=cmd_sync_latest_daily)
+
 
     
     return p
@@ -295,6 +316,126 @@ def cmd_update_fixed_pi(args: argparse.Namespace) -> None:
     print("new_ts:", new_ts, "price:", new_price)
     print("wealth:", res.wealth, "shares:", res.shares_risky, "cash:", res.cash_risk_free)
 
+
+def estimate_asof(conn, symbol: str, asof_ts: str, window: int, annual_days: int):
+    prices = get_prices(conn, symbol, "DAILY")
+    prices = prices[prices["ts_utc"] <= asof_ts]
+    need = window + 1
+    if len(prices) < need:
+        return None
+    window_prices = prices.tail(need).reset_index(drop=True)
+    rets = compute_log_returns(window_prices)
+    if len(rets) != window:
+        return None
+    return estimate_mu_sigma_from_log_returns(rets["log_return"], trading_days_per_year=annual_days)
+
+
+def cmd_update_hjb(args: argparse.Namespace) -> None:
+    conn = connect()
+    init_db(conn)
+
+    state = load_state(conn)
+    if state is None:
+        raise SystemExit("Aucun état. Lance d'abord init.")
+
+    nxt = get_next_price_after(conn, state.symbol, "DAILY", state.last_ts_utc)
+    if nxt is None:
+        raise SystemExit("Aucun nouveau prix DAILY après last_ts_utc.")
+
+    new_ts, new_price = nxt
+
+    # 1) valorisation
+    dy = dt_years(state.last_ts_utc, new_ts)
+    cash_grown = grow_cash(state.cash_risk_free, state.risk_free_rate, dy)
+    x_before = wealth(state.shares_risky, new_price, cash_grown)
+
+    # 2) estimation mu/sigma annualisés (peut être None)
+    window = args.window
+    annual_days = args.annual_days
+    est = estimate_asof(conn, state.symbol, new_ts, window=window, annual_days=annual_days)
+    if est is None:
+        raise SystemExit("Pas assez d'historique DAILY pour estimer mu/sigma (augmente les prix en base).")
+
+    mu_a = est.mean_annual
+    sig_a = est.vol_annual
+
+    # 3) solveur HJB sur une fenêtre de richesse autour de X
+    x_min = max(args.xmin_floor, args.x_min_factor * x_before)
+    x_max = args.x_max_factor * x_before
+    nx = args.nx
+    T = state.horizon_years  # horizon fixe de ton modèle
+    nt = recommend_nt(T, x_min, x_max, nx, sig_a, state.pi_max)
+    grid = make_grid(x_min, x_max, nx, T, nt)
+
+    hjb = solve_hjb_fd(
+        x=grid.x, t=grid.t,
+        r=state.risk_free_rate,
+        mu=mu_a,
+        sigma=sig_a,
+        gamma=state.gamma,
+        pi_min=state.pi_min,
+        pi_max=state.pi_max,
+        bc=args.bc
+    )
+
+    pi_star = interp_policy(hjb.grid_x, hjb.pi0, x_before)
+
+    # 4) rebalance
+    res = rebalance_to_pi(
+        wealth=x_before,
+        price=new_price,
+        pi=pi_star,
+        pi_min=state.pi_min,
+        pi_max=state.pi_max,
+    )
+
+    new_state = PortfolioState(
+        symbol=state.symbol,
+        risk_free_rate=state.risk_free_rate,
+        gamma=state.gamma,
+        horizon_years=state.horizon_years,
+        pi_min=state.pi_min,
+        pi_max=state.pi_max,
+        shares_risky=res.shares_risky,
+        cash_risk_free=res.cash_risk_free,
+        last_ts_utc=new_ts,
+        last_price=new_price,
+        last_wealth=res.wealth,
+    )
+    upsert_state(conn, new_state)
+
+    upsert_equity_point(
+        conn=conn,
+        symbol=new_state.symbol,
+        ts_utc=new_state.last_ts_utc,
+        wealth=new_state.last_wealth,
+        price=new_state.last_price,
+        shares_risky=new_state.shares_risky,
+        cash_risk_free=new_state.cash_risk_free,
+        note="REBAL_HJB",
+    )
+
+    insert_rebalance(
+        conn=conn,
+        symbol=new_state.symbol,
+        ts_utc=new_ts,
+        price=new_price,
+        wealth_before=x_before,
+        wealth_after=res.wealth,
+        shares_risky=res.shares_risky,
+        cash_risk_free=res.cash_risk_free,
+        pi=pi_star,
+        mu_annual=mu_a,
+        sigma_annual=sig_a,
+        window=window,
+        annual_days=annual_days,
+        note="HJB",
+    )
+
+    log_event(conn, "UPDATE_HJB", {"ts": new_ts, "price": new_price, "pi": pi_star, "mu": mu_a, "sigma": sig_a})
+    print("OK update_hjb:", new_ts, "price", new_price, "pi*", pi_star)
+
+
 def cmd_estimate(args: argparse.Namespace) -> None:
     conn = connect()
     init_db(conn)
@@ -395,6 +536,53 @@ def cmd_hjb_test(args: argparse.Namespace) -> None:
     a_max = (pi_max * sigma * x_max) ** 2
     print("stability ratio ~ dt * a_max / dx^2 =", grid.dt * a_max / (grid.dx * grid.dx))
 
+def cmd_sync_latest_daily(args: argparse.Namespace) -> None:
+    conn = connect()
+    init_db(conn)
+
+    state = load_state(conn)
+    if state is None:
+        raise SystemExit("Aucun état. Lance d'abord init.")
+
+    latest = get_latest_price(conn, state.symbol, "DAILY")
+    if latest is None:
+        raise SystemExit("Aucun prix DAILY en base pour ce symbol.")
+
+    ts, price = latest
+
+    # On valorise à ce ts (croissance du cash) et on recalcule la richesse
+    dy = dt_years(state.last_ts_utc, ts)
+    cash_grown = grow_cash(state.cash_risk_free, state.risk_free_rate, dy)
+    x_now = wealth(state.shares_risky, price, cash_grown)
+
+    new_state = PortfolioState(
+        symbol=state.symbol,
+        risk_free_rate=state.risk_free_rate,
+        gamma=state.gamma,
+        horizon_years=state.horizon_years,
+        pi_min=state.pi_min,
+        pi_max=state.pi_max,
+        shares_risky=state.shares_risky,     # inchangé
+        cash_risk_free=cash_grown,           # cash mis à jour
+        last_ts_utc=ts,
+        last_price=price,
+        last_wealth=x_now,
+    )
+    upsert_state(conn, new_state)
+
+    upsert_equity_point(
+        conn=conn,
+        symbol=new_state.symbol,
+        ts_utc=new_state.last_ts_utc,
+        wealth=new_state.last_wealth,
+        price=new_state.last_price,
+        shares_risky=new_state.shares_risky,
+        cash_risk_free=new_state.cash_risk_free,
+        note="SYNC_LATEST_DAILY",
+    )
+
+    log_event(conn, "SYNC_LATEST_DAILY", {"symbol": state.symbol, "ts": ts, "price": price})
+    print("OK sync:", ts, "price", price, "wealth", x_now)
 
 
 if __name__ == "__main__":
