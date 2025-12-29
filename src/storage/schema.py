@@ -41,4 +41,39 @@ CREATE TABLE IF NOT EXISTS prices (
 CREATE INDEX IF NOT EXISTS idx_prices_sym_gran_ts
 ON prices(symbol, granularity, ts_utc);
 
+CREATE TABLE IF NOT EXISTS equity_curve (
+  symbol          TEXT NOT NULL,
+  ts_utc          TEXT NOT NULL,   -- timestamp ISO8601 UTC
+  wealth          REAL NOT NULL,   -- X_t
+  price           REAL NOT NULL,   -- S_t utilisé
+  shares_risky    REAL NOT NULL,   -- n_t
+  cash_risk_free  REAL NOT NULL,   -- B_t
+  note            TEXT,
+  PRIMARY KEY (symbol, ts_utc)
+);
+
+CREATE INDEX IF NOT EXISTS idx_equity_sym_ts
+ON equity_curve(symbol, ts_utc);
+
+CREATE TABLE IF NOT EXISTS rebalances (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  symbol         TEXT NOT NULL,
+  ts_utc         TEXT NOT NULL,      -- timestamp du rebalance (décision appliquée)
+  price          REAL NOT NULL,      -- S_t utilisé
+  wealth_before  REAL NOT NULL,      -- X juste avant rebalance (après valorisation)
+  wealth_after   REAL NOT NULL,      -- X après rebalance (identique si pas de coûts)
+  shares_risky   REAL NOT NULL,      -- n après rebalance
+  cash_risk_free REAL NOT NULL,      -- B après rebalance
+  pi             REAL NOT NULL,      -- pi appliqué (fixe ici)
+
+  mu_annual      REAL,              -- estimé sur fenêtre, peut être NULL si pas assez d'historique
+  sigma_annual   REAL,
+  window         INTEGER,
+  annual_days    INTEGER,
+  note           TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_reb_sym_ts
+ON rebalances(symbol, ts_utc);
+
 """
