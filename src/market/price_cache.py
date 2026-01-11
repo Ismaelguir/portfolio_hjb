@@ -93,27 +93,6 @@ def get_latest_price(
         return None
     return (row["ts_utc"], float(row["price"]))
 
-def get_next_price_after(
-    conn: sqlite3.Connection,
-    symbol: str,
-    granularity: str,
-    after_ts_utc: str,
-) -> Optional[tuple[str, float]]:
-    row = conn.execute(
-        """
-        SELECT ts_utc, price
-        FROM prices
-        WHERE symbol=? AND granularity=? AND ts_utc > ?
-        ORDER BY ts_utc ASC
-        LIMIT 1
-        """,
-        (symbol, granularity, after_ts_utc),
-    ).fetchone()
-
-    if row is None:
-        return None
-    return (row["ts_utc"], float(row["price"]))
-
 
 def get_next_price_after(
     conn: sqlite3.Connection,

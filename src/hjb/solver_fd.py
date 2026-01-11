@@ -37,7 +37,7 @@ def solve_hjb_fd(
 ) -> HJBResult:
     """
     Schéma explicite backward :
-      V^n = V^{n+1} - dt * H(V_x^{n+1}, V_xx^{n+1})
+      V^n = V^{n+1} + dt * H(V_x^{n+1}, V_xx^{n+1})
     où H utilise pi* dérivé de V^{n+1}.
     """
     nx = x.size
