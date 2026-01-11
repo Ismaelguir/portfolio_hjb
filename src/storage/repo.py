@@ -207,3 +207,43 @@ def insert_rebalance(
         ),
     )
     conn.commit()
+
+
+from dataclasses import dataclass
+import sqlite3
+
+
+@dataclass(frozen=True)
+class RunConfig:
+    window: int
+    annual_days: int
+    nx: int
+    bc: str
+    x_min_factor: float
+    x_max_factor: float
+    xmin_floor: float
+
+
+def get_run_config(conn: sqlite3.Connection) -> RunConfig:
+    row = conn.execute(
+        "SELECT window, annual_days, nx, bc, x_min_factor, x_max_factor, xmin_floor "
+        "FROM run_config WHERE id=1"
+    ).fetchone()
+    return RunConfig(
+        window=int(row["window"]),
+        annual_days=int(row["annual_days"]),
+        nx=int(row["nx"]),
+        bc=str(row["bc"]),
+        x_min_factor=float(row["x_min_factor"]),
+        x_max_factor=float(row["x_max_factor"]),
+        xmin_floor=float(row["xmin_floor"]),
+    )
+
+
+def set_run_config(conn: sqlite3.Connection, cfg: RunConfig) -> None:
+    conn.execute(
+        "UPDATE run_config SET window=?, annual_days=?, nx=?, bc=?, x_min_factor=?, x_max_factor=?, xmin_floor=? "
+        "WHERE id=1",
+        (cfg.window, cfg.annual_days, cfg.nx, cfg.bc, cfg.x_min_factor, cfg.x_max_factor, cfg.xmin_floor),
+    )
+    conn.commit()

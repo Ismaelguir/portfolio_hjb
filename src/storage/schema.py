@@ -76,4 +76,21 @@ CREATE TABLE IF NOT EXISTS rebalances (
 CREATE INDEX IF NOT EXISTS idx_reb_sym_ts
 ON rebalances(symbol, ts_utc);
 
+CREATE TABLE IF NOT EXISTS run_config (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  window INTEGER NOT NULL,
+  annual_days INTEGER NOT NULL,
+  nx INTEGER NOT NULL,
+  bc TEXT NOT NULL,
+  x_min_factor REAL NOT NULL,
+  x_max_factor REAL NOT NULL,
+  xmin_floor REAL NOT NULL
+);
+
+INSERT OR IGNORE INTO run_config
+(id, window, annual_days, nx, bc, x_min_factor, x_max_factor, xmin_floor)
+VALUES
+(1, 60, 252, 400, 'NEUMANN', 0.1, 3.0, 1e-3);
+
+
 """

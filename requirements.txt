@@ -3,4 +3,4 @@ numpy
 pandas
 matplotlib
 python-dotenv
-pydantic
+pydanticstreamlit
