@@ -174,7 +174,7 @@ def get_latest_equity_point(conn: sqlite3.Connection, symbol: str) -> Optional[t
     return (row["ts_utc"], float(row["wealth"]))
 
 def insert_rebalance(
-    conn: sqlite3.Connection,
+    conn,
     symbol: str,
     ts_utc: str,
     price: float,
@@ -187,26 +187,44 @@ def insert_rebalance(
     sigma_annual: float | None,
     window: int | None,
     annual_days: int | None,
-    note: str | None = None,
+    note: str = "",
+    sigma_method: str | None = None,
+    ewma_lambda: float | None = None,
+    gbm_correction: bool | None = None,
 ) -> None:
+    gbm_int = None if gbm_correction is None else (1 if gbm_correction else 0)
+
     conn.execute(
         """
         INSERT INTO rebalances(
           symbol, ts_utc, price, wealth_before, wealth_after,
           shares_risky, cash_risk_free, pi,
-          mu_annual, sigma_annual, window, annual_days, note
+          mu_annual, sigma_annual, sigma_method, ewma_lambda, gbm_correction,
+          window, annual_days, note
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            symbol, ts_utc, float(price), float(wealth_before), float(wealth_after),
-            float(shares_risky), float(cash_risk_free), float(pi),
-            (None if mu_annual is None else float(mu_annual)),
-            (None if sigma_annual is None else float(sigma_annual)),
-            window, annual_days, note
+            symbol,
+            ts_utc,
+            float(price),
+            float(wealth_before),
+            float(wealth_after),
+            float(shares_risky),
+            float(cash_risk_free),
+            float(pi),
+            None if mu_annual is None else float(mu_annual),
+            None if sigma_annual is None else float(sigma_annual),
+            sigma_method,
+            ewma_lambda,
+            gbm_int,
+            window,
+            annual_days,
+            note,
         ),
     )
     conn.commit()
+
 
 
 from dataclasses import dataclass
@@ -215,8 +233,12 @@ import sqlite3
 
 @dataclass(frozen=True)
 class RunConfig:
-    window: int
+    mu_window: int
+    sigma_window: int
     annual_days: int
+    sigma_method: str        # "std" or "ewma"
+    ewma_lambda: float | None
+    gbm_correction: bool
     nx: int
     bc: str
     x_min_factor: float
@@ -224,14 +246,26 @@ class RunConfig:
     xmin_floor: float
 
 
+
 def get_run_config(conn: sqlite3.Connection) -> RunConfig:
     row = conn.execute(
-        "SELECT window, annual_days, nx, bc, x_min_factor, x_max_factor, xmin_floor "
-        "FROM run_config WHERE id=1"
+        """
+        SELECT
+          mu_window, sigma_window, annual_days,
+          sigma_method, ewma_lambda, gbm_correction,
+          nx, bc, x_min_factor, x_max_factor, xmin_floor
+        FROM run_config
+        WHERE id=1
+        """
     ).fetchone()
+
     return RunConfig(
-        window=int(row["window"]),
+        mu_window=int(row["mu_window"]),
+        sigma_window=int(row["sigma_window"]),
         annual_days=int(row["annual_days"]),
+        sigma_method=str(row["sigma_method"]),
+        ewma_lambda=(None if row["ewma_lambda"] is None else float(row["ewma_lambda"])),
+        gbm_correction=bool(int(row["gbm_correction"])),
         nx=int(row["nx"]),
         bc=str(row["bc"]),
         x_min_factor=float(row["x_min_factor"]),
@@ -240,10 +274,37 @@ def get_run_config(conn: sqlite3.Connection) -> RunConfig:
     )
 
 
+
 def set_run_config(conn: sqlite3.Connection, cfg: RunConfig) -> None:
     conn.execute(
-        "UPDATE run_config SET window=?, annual_days=?, nx=?, bc=?, x_min_factor=?, x_max_factor=?, xmin_floor=? "
-        "WHERE id=1",
-        (cfg.window, cfg.annual_days, cfg.nx, cfg.bc, cfg.x_min_factor, cfg.x_max_factor, cfg.xmin_floor),
+        """
+        UPDATE run_config
+        SET
+          mu_window=?,
+          sigma_window=?,
+          annual_days=?,
+          sigma_method=?,
+          ewma_lambda=?,
+          gbm_correction=?,
+          nx=?,
+          bc=?,
+          x_min_factor=?,
+          x_max_factor=?,
+          xmin_floor=?
+        WHERE id=1
+        """,
+        (
+            int(cfg.mu_window),
+            int(cfg.sigma_window),
+            int(cfg.annual_days),
+            str(cfg.sigma_method),
+            (None if cfg.sigma_method == "std" else cfg.ewma_lambda),
+            1 if cfg.gbm_correction else 0,
+            int(cfg.nx),
+            str(cfg.bc),
+            float(cfg.x_min_factor),
+            float(cfg.x_max_factor),
+            float(cfg.xmin_floor),
+        ),
     )
     conn.commit()

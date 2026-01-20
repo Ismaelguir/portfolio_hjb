@@ -101,13 +101,25 @@ def get_equity_curve(
 def get_rebalances(symbol: str, limit: int = 200) -> pd.DataFrame:
     conn = connect()
     q = """
-    SELECT ts_utc, price, pi, mu_annual, sigma_annual, wealth_before, wealth_after, note
+    SELECT
+      ts_utc,
+      price,
+      pi,
+      mu_annual,
+      sigma_annual,
+      sigma_method,
+      ewma_lambda,
+      gbm_correction,
+      wealth_before,
+      wealth_after,
+      note
     FROM rebalances
     WHERE symbol = ?
     ORDER BY ts_utc DESC
     LIMIT ?
     """
     return pd.read_sql_query(q, conn, params=(symbol, int(limit)))
+
 
 
 def get_events(limit: int = 300) -> pd.DataFrame:

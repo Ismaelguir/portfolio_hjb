@@ -27,6 +27,10 @@ from app.engine import update_hjb_step
 from app.engine import estimate_asof
 from app.engine import backup_db_file, reset_state_tables, reset_all_tables
 
+from app.engine import setup_portfolio
+from storage.repo import get_run_config
+
+
 def cmd_init(args: argparse.Namespace) -> None:
     conn = connect()
     init_db(conn)
@@ -227,7 +231,17 @@ def cmd_update_hjb(args: argparse.Namespace) -> None:
     # 2) estimation mu/sigma annualisés
     window = args.window
     annual_days = args.annual_days
-    est = estimate_asof(conn, state.symbol, new_ts, window=window, annual_days=annual_days)
+    est = estimate_asof(
+    conn,
+    state.symbol,
+    new_ts,
+    window=window,
+    annual_days=annual_days,
+    sigma_method=args.sigma_method,
+    ewma_lambda=args.ewma_lambda,
+    gbm_correction=not args.no_gbm_correction,
+)
+
     if est is None:
         raise SystemExit("Pas assez d'historique DAILY pour estimer mu/sigma (augmente les prix en base).")
 
@@ -305,6 +319,10 @@ def cmd_update_hjb(args: argparse.Namespace) -> None:
         window=window,
         annual_days=annual_days,
         note="HJB",
+        sigma_method=args.sigma_method,
+        ewma_lambda=(None if args.sigma_method == "std" else args.ewma_lambda),
+        gbm_correction=(not args.no_gbm_correction),
+
     )
 
     log_event(conn, "UPDATE_HJB", {"ts": new_ts, "price": new_price, "pi": pi_star, "mu": mu_a, "sigma": sig_a})
@@ -334,7 +352,14 @@ def cmd_estimate(args: argparse.Namespace) -> None:
             f"Incohérence: {len(rets)} rendements obtenus, attendu {args.window}."
         )
 
-    est = estimate_mu_sigma_from_log_returns(rets["log_return"], trading_days_per_year=args.annual_days)
+    est = estimate_mu_sigma_from_log_returns(
+    rets["log_return"],
+    trading_days_per_year=args.annual_days,
+    sigma_method=args.sigma_method,
+    ewma_lambda=args.ewma_lambda,
+    gbm_correction=not args.no_gbm_correction,
+)
+
 
     asof_ts = window_prices["ts_utc"].iloc[-1]
     log_event(
@@ -349,12 +374,16 @@ def cmd_estimate(args: argparse.Namespace) -> None:
             "sigma_daily": est.vol_daily,
             "mu_annual": est.mean_annual,
             "sigma_annual": est.vol_annual,
+            "sigma_method": args.sigma_method,
+            "ewma_lambda": (None if args.sigma_method == "std" else args.ewma_lambda),
+            "gbm_correction": (not args.no_gbm_correction),
         },
     )
 
     print(f"Estimation (asof {asof_ts}) sur {args.window} rendements log:")
     print(f"  mu_daily    = {est.mean_daily:.8f}")
     print(f"  sigma_daily = {est.vol_daily:.8f}")
+    print(f"  mu_annual_log = {est.mean_annual_log:.6f}")
     print(f"  mu_annual   = {est.mean_annual:.6f}")
     print(f"  sigma_annual= {est.vol_annual:.6f}")
 
@@ -518,7 +547,11 @@ def cmd_run_daily(args: argparse.Namespace) -> None:
             x_max_factor=args.x_max_factor,
             xmin_floor=args.xmin_floor,
             bc=args.bc,
+            sigma_method=args.sigma_method,
+            ewma_lambda=args.ewma_lambda,
+            gbm_correction=not args.no_gbm_correction,
         )
+
         state = res.new_state
         steps += 1
         print(f"OK {steps}: {res.ts_utc} price={res.price} pi*={res.pi_star:.6f} wealth={state.last_wealth:.6f}")
@@ -602,3 +635,33 @@ def cmd_init_auto(args: argparse.Namespace) -> None:
 
     log_event(conn, "INIT_AUTO", {"symbol": st.symbol, "ts": ts, "price": float(price), "x0": float(args.x0)})
     print("OK init_auto:", st)
+
+
+def cmd_setup(args: argparse.Namespace) -> None:
+    conn = connect()
+    init_db(conn)
+
+    st = setup_portfolio(
+        conn,
+        symbol=args.symbol,
+        x0=args.x0,
+        r=args.r,
+        gamma=args.gamma,
+        T=args.T,
+        pi_min=args.pi_min,
+        pi_max=args.pi_max,
+        mu_window=args.mu_window,
+        sigma_window=args.sigma_window,
+        annual_days=args.annual_days,
+        sigma_method=args.sigma_method,
+        ewma_lambda=args.ewma_lambda,
+        gbm_correction=(not args.no_gbm_correction),
+        nx=args.nx,
+        bc=args.bc,
+        x_min_factor=args.x_min_factor,
+        x_max_factor=args.x_max_factor,
+        xmin_floor=args.xmin_floor,
+        fetch_prices=(not args.no_fetch_prices),
+        outputsize=args.outputsize,
+    )
+    print("OK setup:", st)

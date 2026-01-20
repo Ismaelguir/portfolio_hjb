@@ -14,6 +14,9 @@ from storage.repo import upsert_state, upsert_equity_point, insert_rebalance, lo
 from hjb.grid import make_grid
 from hjb.solver_fd import solve_hjb_fd, recommend_nt
 from hjb.policy import interp_policy
+from market.alphavantage import fetch_daily_close, AlphaVantageError
+from market.price_cache import insert_prices, get_latest_price
+from storage.repo import PortfolioState, RunConfig, set_run_config
 
 
 from pathlib import Path
@@ -23,7 +26,17 @@ import sqlite3
 
 from storage.db import get_db_path
 
-def estimate_asof(conn, symbol: str, asof_ts: str, window: int, annual_days: int):
+def estimate_asof(
+    conn,
+    symbol: str,
+    asof_ts: str,
+    window: int,
+    annual_days: int,
+    *,
+    sigma_method: str = "ewma",
+    ewma_lambda: float = 0.94,
+    gbm_correction: bool = True,
+):
     prices = get_prices(conn, symbol, "DAILY")
     prices = prices[prices["ts_utc"] <= asof_ts]
     need = window + 1
@@ -33,7 +46,125 @@ def estimate_asof(conn, symbol: str, asof_ts: str, window: int, annual_days: int
     rets = compute_log_returns(window_prices)
     if len(rets) != window:
         return None
-    return estimate_mu_sigma_from_log_returns(rets["log_return"], trading_days_per_year=annual_days)
+    return estimate_mu_sigma_from_log_returns(
+        rets["log_return"],
+        trading_days_per_year=annual_days,
+        sigma_method=sigma_method,
+        ewma_lambda=ewma_lambda,
+        gbm_correction=gbm_correction,
+    )
+
+def setup_portfolio(
+    conn,
+    *,
+    symbol: str,
+    x0: float,
+    r: float,
+    gamma: float,
+    T: float,
+    pi_min: float,
+    pi_max: float,
+    # run_config (step 1)
+    mu_window: int,
+    sigma_window: int,
+    annual_days: int,
+    sigma_method: str,
+    ewma_lambda: float | None,
+    gbm_correction: bool,
+    nx: int,
+    bc: str,
+    x_min_factor: float,
+    x_max_factor: float,
+    xmin_floor: float,
+    # prices
+    fetch_prices: bool = True,
+    outputsize: str = "compact",
+) -> PortfolioState:
+    # 1) écrire la config d'exécution
+    cfg = RunConfig(
+        mu_window=int(mu_window),
+        sigma_window=int(sigma_window),
+        annual_days=int(annual_days),
+        sigma_method=str(sigma_method),
+        ewma_lambda=(None if str(sigma_method) == "std" else (None if ewma_lambda is None else float(ewma_lambda))),
+        gbm_correction=bool(gbm_correction),
+        nx=int(nx),
+        bc=str(bc),
+        x_min_factor=float(x_min_factor),
+        x_max_factor=float(x_max_factor),
+        xmin_floor=float(xmin_floor),
+    )
+    set_run_config(conn, cfg)
+
+    # 2) (optionnel) refresh prices daily
+    if fetch_prices:
+        try:
+            rows = fetch_daily_close(symbol, outputsize=outputsize)
+        except AlphaVantageError as e:
+            raise SystemExit(f"Echec Alpha Vantage (daily): {e}")
+        insert_prices(conn, symbol, "DAILY", rows, source="ALPHAVANTAGE")
+
+    # 3) dernier prix dispo
+    latest = get_latest_price(conn, symbol, "DAILY")
+    if latest is None:
+        raise SystemExit("Aucun prix DAILY disponible en base pour initialiser (charge des prix d'abord).")
+    ts, price = latest
+
+    # 4) état initial (tout en cash)
+    st = PortfolioState(
+        symbol=symbol,
+        risk_free_rate=float(r),
+        gamma=float(gamma),
+        horizon_years=float(T),
+        pi_min=float(pi_min),
+        pi_max=float(pi_max),
+        shares_risky=0.0,
+        cash_risk_free=float(x0),
+        last_ts_utc=str(ts),
+        last_price=float(price),
+        last_wealth=float(x0),
+    )
+    upsert_state(conn, st)
+
+    # 5) seed equity
+    upsert_equity_point(
+        conn=conn,
+        symbol=st.symbol,
+        ts_utc=st.last_ts_utc,
+        wealth=st.last_wealth,
+        price=st.last_price,
+        shares_risky=st.shares_risky,
+        cash_risk_free=st.cash_risk_free,
+        note="SETUP",
+    )
+
+    # 6) log
+    log_event(conn, "SETUP", {
+        "symbol": symbol,
+        "x0": float(x0),
+        "r": float(r),
+        "gamma": float(gamma),
+        "T": float(T),
+        "pi_min": float(pi_min),
+        "pi_max": float(pi_max),
+        "run_config": {
+            "mu_window": cfg.mu_window,
+            "sigma_window": cfg.sigma_window,
+            "annual_days": cfg.annual_days,
+            "sigma_method": cfg.sigma_method,
+            "ewma_lambda": cfg.ewma_lambda,
+            "gbm_correction": cfg.gbm_correction,
+            "nx": cfg.nx,
+            "bc": cfg.bc,
+            "x_min_factor": cfg.x_min_factor,
+            "x_max_factor": cfg.x_max_factor,
+            "xmin_floor": cfg.xmin_floor,
+        },
+        "last_ts_utc": st.last_ts_utc,
+        "last_price": st.last_price,
+    })
+
+    return st
 
 
 @dataclass(frozen=True)
@@ -59,6 +190,10 @@ def update_hjb_step(
     x_max_factor: float,
     xmin_floor: float,
     bc: str,
+    *,
+    sigma_method: str = "ewma",
+    ewma_lambda: float = 0.94,
+    gbm_correction: bool = True,
 ) -> HJBStepResult:
     # 1) valorisation (cash + richesse)
     dy = dt_years(state.last_ts_utc, new_ts)
@@ -66,7 +201,17 @@ def update_hjb_step(
     x_before = wealth(state.shares_risky, new_price, cash_grown)
 
     # 2) estimation mu/sigma annualisés
-    est = estimate_asof(conn, state.symbol, new_ts, window=window, annual_days=annual_days)
+    est = estimate_asof(
+    conn,
+    state.symbol,
+    new_ts,
+    window=window,
+    annual_days=annual_days,
+    sigma_method=sigma_method,
+    ewma_lambda=ewma_lambda,
+    gbm_correction=gbm_correction,
+)
+
     if est is None:
         raise RuntimeError("Pas assez d'historique DAILY pour estimer mu/sigma.")
     mu_a = est.mean_annual
@@ -142,6 +287,10 @@ def update_hjb_step(
         window=window,
         annual_days=annual_days,
         note="HJB",
+        sigma_method=sigma_method,
+        ewma_lambda=(None if sigma_method == "std" else ewma_lambda),
+        gbm_correction=gbm_correction,
+
     )
 
     log_event(conn, "UPDATE_HJB_STEP", {
